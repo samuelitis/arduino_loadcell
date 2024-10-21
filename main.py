@@ -1,10 +1,9 @@
+import os
 import asyncio
-import threading
-import queue
+import aiofiles
 import csv
 from bleak import BleakScanner, BleakClient
 from datetime import datetime
-import sys
 
 WEIGHT_UUID = "00002A57-0000-1000-8000-00805F9B34FB"
 BATTERY_UUID = "00002A19-0000-1000-8000-00805F9B34FB"
@@ -15,30 +14,14 @@ if not experiment_name:
     experiment_name = "loadcell"
 
 timestamp = datetime.now().strftime("%y%m%d_%H%M")
-CSV_FILE_PATH = f"./test/{experiment_name}_{timestamp}.csv"
+FOLDER_PATH = f"./test/{experiment_name}_{timestamp}"
 
-data_queue = queue.Queue()
+if not os.path.exists(FOLDER_PATH):
+    os.makedirs(FOLDER_PATH)
 
-def save_data_to_csv():
-    """큐에 있는 데이터를 주기적으로 파일에 저장하는 스레드"""
-    with open(CSV_FILE_PATH, mode='w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(["Timestamp", "Load", "Battery", "Clock Time"])
-
-        while True:
-            data_batch = []
-            try:
-                while not data_queue.empty():
-                    data_batch.append(data_queue.get(timeout=1)) 
-            except queue.Empty:
-                pass
-
-            if data_batch:
-                writer.writerows(data_batch)
-                print(f"Saved {len(data_batch)} rows to {CSV_FILE_PATH}")
-            
-            if not data_batch:
-                threading.Event().wait(1)
+ROW_BUFFER_LIMIT = 1000
+row_count = 0
+file_count = 1
 
 async def select_device():
     print("BLE 장치를 스캔 중입니다...")
@@ -66,11 +49,12 @@ async def run_ble_client():
                     weight_value = await client.read_gatt_char(WEIGHT_UUID)
                     battery_value = await client.read_gatt_char(BATTERY_UUID)
                     time_value = await client.read_gatt_char(TIME_UUID)
-                    process_data(weight_value, battery_value, time_value)
+                    await process_data(weight_value, battery_value, time_value)
             except Exception as e:
                 print(f"An error occurred: {str(e)}")
 
-def process_data(weight_value, battery_value, time_value):
+async def process_data(weight_value, battery_value, time_value):
+    global row_count, file_count
     try:
         load = int.from_bytes(weight_value, byteorder='little', signed=True) / 1000
         adc_value = int.from_bytes(battery_value, byteorder='little', signed=True) / 1000.0
@@ -78,20 +62,44 @@ def process_data(weight_value, battery_value, time_value):
         clock_time = int.from_bytes(time_value, byteorder='little', signed=False)
         clock_timestamp = clock_time
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        
-        data_queue.put([timestamp, load, adc_value, clock_timestamp])
+
         print(f"Timestamp: {timestamp} \t|\t Load: {load:.2f} N \t|\t Battery: {adc_value:.2f} \t|\t Clock Time: {clock_timestamp}")
+
+        await write_to_txt([timestamp, load, adc_value, clock_timestamp])
+
+        row_count += 1
+        if row_count >= ROW_BUFFER_LIMIT:
+            row_count = 0
+            file_count += 1
 
     except ValueError:
         print("Received non-numeric data, unable to convert")
 
+async def write_to_txt(row):
+    """현재 파일에 데이터를 한 줄 추가"""
+    file_path = os.path.join(FOLDER_PATH, f"{file_count}.txt")
+    async with aiofiles.open(file_path, mode='a') as file:
+        await file.write(','.join(map(str, row)) + '\n')
+
+async def merge_txt_to_csv():
+    """저장된 모든 txt 파일을 하나의 CSV 파일로 병합"""
+    csv_file_path = os.path.join(FOLDER_PATH, f"{experiment_name}_{timestamp}.csv")
+    with open(csv_file_path, mode='w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Timestamp", "Load", "Battery", "Clock Time"])
+
+        txt_files = sorted([f for f in os.listdir(FOLDER_PATH) if f.endswith(".txt")], key=lambda x: int(x.split('.')[0]))
+
+        for txt_file in txt_files:
+            txt_file_path = os.path.join(FOLDER_PATH, txt_file)
+            async with aiofiles.open(txt_file_path, mode='r') as file:
+                async for line in file:
+                    writer.writerow(line.strip().split(','))
+
 if __name__ == "__main__":
     try:
-        save_thread = threading.Thread(target=save_data_to_csv, daemon=True)
-        save_thread.start()
-
         asyncio.run(run_ble_client())
-
     except KeyboardInterrupt:
-        print("Keyboard Interrupt: Saving any remaining data and closing.")
-        sys.exit(0)
+        print("프로그램 종료 중... 모든 txt 파일을 CSV로 병합합니다.")
+        asyncio.run(merge_txt_to_csv())
+        print(f"CSV 파일로 병합 완료: {FOLDER_PATH}")
