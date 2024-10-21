@@ -1,6 +1,8 @@
 import asyncio
+import threading
+import queue
+import csv
 from bleak import BleakScanner, BleakClient
-from openpyxl import Workbook
 from datetime import datetime
 import sys
 
@@ -13,16 +15,31 @@ if not experiment_name:
     experiment_name = "loadcell"
 
 timestamp = datetime.now().strftime("%y%m%d_%H%M")
-EXCEL_FILE_PATH = f"./test/{experiment_name}_{timestamp}.xlsx"
+CSV_FILE_PATH = f"./test/{experiment_name}_{timestamp}.csv"
 
-wb = Workbook(write_only=True)
-ws = wb.create_sheet(title="Loadcell Data")
-ws.append(["Timestamp", "Load", "Battery", "Clock Time"])
+data_queue = queue.Queue()
 
-ROW_BUFFER_LIMIT = 1000
-row_count = 0
+def save_data_to_csv():
+    """큐에 있는 데이터를 주기적으로 파일에 저장하는 스레드"""
+    with open(CSV_FILE_PATH, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Timestamp", "Load", "Battery", "Clock Time"])
 
-# BLE 장치 선택
+        while True:
+            data_batch = []
+            try:
+                while not data_queue.empty():
+                    data_batch.append(data_queue.get(timeout=1)) 
+            except queue.Empty:
+                pass
+
+            if data_batch:
+                writer.writerows(data_batch)
+                print(f"Saved {len(data_batch)} rows to {CSV_FILE_PATH}")
+            
+            if not data_batch:
+                threading.Event().wait(1)
+
 async def select_device():
     print("BLE 장치를 스캔 중입니다...")
     devices = await BleakScanner.discover()
@@ -36,7 +53,6 @@ async def select_device():
     print("잘못된 선택입니다.")
     return None
 
-# BLE 클라이언트
 async def run_ble_client():
     device = await select_device()
     if device is None:
@@ -50,12 +66,11 @@ async def run_ble_client():
                     weight_value = await client.read_gatt_char(WEIGHT_UUID)
                     battery_value = await client.read_gatt_char(BATTERY_UUID)
                     time_value = await client.read_gatt_char(TIME_UUID)
-                    await process_data(weight_value, battery_value, time_value)
+                    process_data(weight_value, battery_value, time_value)
             except Exception as e:
                 print(f"An error occurred: {str(e)}")
 
-async def process_data(weight_value, battery_value, time_value):
-    global row_count
+def process_data(weight_value, battery_value, time_value):
     try:
         load = int.from_bytes(weight_value, byteorder='little', signed=True) / 1000
         adc_value = int.from_bytes(battery_value, byteorder='little', signed=True) / 1000.0
@@ -63,29 +78,20 @@ async def process_data(weight_value, battery_value, time_value):
         clock_time = int.from_bytes(time_value, byteorder='little', signed=False)
         clock_timestamp = clock_time
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        ws.append([timestamp, load, adc_value, clock_timestamp])
-        row_count += 1
+        
+        data_queue.put([timestamp, load, adc_value, clock_timestamp])
         print(f"Timestamp: {timestamp} \t|\t Load: {load:.2f} N \t|\t Battery: {adc_value:.2f} \t|\t Clock Time: {clock_timestamp}")
-
-        if row_count >= ROW_BUFFER_LIMIT:
-            save_to_file()
-            row_count = 0
 
     except ValueError:
         print("Received non-numeric data, unable to convert")
 
-def save_to_file():
-    """파일을 동기적으로 저장합니다."""
-    print("Saving data to file...")
-    wb.save(EXCEL_FILE_PATH)
-    print(f"Data saved to {EXCEL_FILE_PATH}")
-
 if __name__ == "__main__":
     try:
+        save_thread = threading.Thread(target=save_data_to_csv, daemon=True)
+        save_thread.start()
+
         asyncio.run(run_ble_client())
+
     except KeyboardInterrupt:
-        print("Keyboard Interrupt: Saving Excel and closing.")
-    finally:
-        save_to_file()
-        wb.close()
+        print("Keyboard Interrupt: Saving any remaining data and closing.")
         sys.exit(0)
