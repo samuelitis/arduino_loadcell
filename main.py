@@ -4,10 +4,13 @@ import aiofiles
 import csv
 from bleak import BleakScanner, BleakClient
 from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
 WEIGHT_UUID = "00002A57-0000-1000-8000-00805F9B34FB"
 BATTERY_UUID = "00002A19-0000-1000-8000-00805F9B34FB"
 TIME_UUID = "00002A2B-0000-1000-8000-00805F9B34FB"
+x_data, load_data, battery_data = [], [], []
 
 experiment_name = input("실험명을 입력하세요 (or press Enter to use 'loadcell'): ")
 if not experiment_name:
@@ -36,6 +39,16 @@ async def select_device():
     print("잘못된 선택입니다.")
     return None
 
+def update_plot(frame):
+    plt.cla()
+    plt.plot(x_data, load_data, label="Load (N)")
+    plt.plot(x_data, battery_data, label="Battery Voltage (V)")
+    plt.xlabel('Time')
+    plt.ylabel('Value')
+    plt.title('Real-time BLE Data Plot')
+    plt.legend()
+    plt.tight_layout()
+    
 async def run_ble_client():
     device = await select_device()
     if device is None:
@@ -49,6 +62,15 @@ async def run_ble_client():
                     weight_value = await client.read_gatt_char(WEIGHT_UUID)
                     battery_value = await client.read_gatt_char(BATTERY_UUID)
                     time_value = await client.read_gatt_char(TIME_UUID)
+                    x_data.append(current_time)
+                    load_data.append(load)
+                    battery_data.append(adc_value)
+                    fig = plt.figure()
+                    ani = FuncAnimation(fig, update_plot, interval=1000)
+                    await asyncio.gather(
+                        read_ble_data(client),
+                        asyncio.to_thread(plt.show)
+                    )
                     await process_data(weight_value, battery_value, time_value)
             except Exception as e:
                 print(f"An error occurred: {str(e)}")
